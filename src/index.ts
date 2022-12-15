@@ -1,75 +1,26 @@
 import express, { Request, Response } from "express";
 import fetch from "node-fetch";
 import fs from "fs";
-
-type TagType = "R" | "P";
-type StateType = -1 | 0 | 1;
+import {
+  broadcastStateToAllNodes,
+  isReady,
+  sendIsReadyToAllNodes,
+  setFaultyNodes,
+} from "./utils/functions";
+import {
+  GlobalVarType,
+  NodeVarType,
+  ReceivedObjectType,
+  StateType,
+} from "./utils/types";
+import { getIndexRoute } from "./route/getIndexRoute";
+import { postReady } from "./route/postReady";
+import { postIndexRoute } from "./route/postIndexRoute";
 
 const logs: Array<string> = [];
-let step = 0;
 
-const broadcastStateToAllNodes = (
-  state: StateType,
-  currentNodeIndex: number,
-  tag: TagType,
-  round: number,
-  N: number,
-  F: number
-) => {
-  // console.log(
-  //   `Broadcasting state=${state} from node #${currentNodeIndex} to all nodes with tag=${tag}`
-  // );
-
-  for (let index = 0; index < N; index++) {
-    // if (index === currentNodeIndex) continue;
-    // console.log(
-    //   `--> Sending request from node #${currentNodeIndex} to node #${index}`
-    // );
-    logs.push(
-      `BROADCAST_MESSAGE-r${round}-s${step}-from#${currentNodeIndex}-to#${index}-t${tag}-s${state}`
-    );
-    step++;
-
-    fetch(`http://localhost:${3000 + index}/`, {
-      method: "POST",
-      body: JSON.stringify({
-        nodeIndex: currentNodeIndex,
-        tag: tag,
-        round: round,
-        state: state,
-      }),
-      headers: { "Content-Type": "application/json" },
-    });
-  }
-};
-
-const sendIsReadyToAllNodes = async (currentNodeIndex: number, N: number) => {
-  for (let index = 0; index < N; index++) {
-    await fetch(`http://localhost:${3000 + index}/ready`, {
-      method: "POST",
-      body: JSON.stringify({
-        nodeIndex: currentNodeIndex,
-      }),
-      headers: { "Content-Type": "application/json" },
-    });
-  }
-};
-
-const isReady = (readyStates: Array<boolean>) => {
-  return readyStates.reduce((prev: boolean, curr: boolean) => prev && curr);
-};
-
-// make a total of _f nodes faulty (true)
-const setFaultyNodes = (_nodeIsFaultyArray: Array<boolean>, _f: number) => {
-  for (let index = 0; index < _f; index++) {
-    let randomIndex =
-      Math.floor(Math.random() * 1000) % _nodeIsFaultyArray.length;
-    while (_nodeIsFaultyArray[randomIndex] === true) {
-      randomIndex =
-        Math.floor(Math.random() * 1000) % _nodeIsFaultyArray.length;
-    }
-    _nodeIsFaultyArray[randomIndex] = true;
-  }
+let globalVar: GlobalVarType = {
+  step: 0,
 };
 
 const launchNode = async (
@@ -85,196 +36,81 @@ const launchNode = async (
   app.set("trust proxy", 1);
   app.use(express.json());
 
-  let decision: number | undefined;
-  let state = initialState;
-  let round = 1;
+  const nodeVar: NodeVarType = {
+    index: nodeIndex,
+    decision: undefined,
+    state: initialState,
+    round: 1,
+  };
 
   const readyStates = Array(N).fill(false);
   let broadcastedInitialMessages = false;
 
   const goToNextRound = () => {
-    round += 1;
+    nodeVar.round += 1;
     broadcastedInitialMessages = false;
   };
 
   app.get("/", (req: Request, res: Response) => {
-    if (isFaulty) {
-      res.status(500).send("Node is faulty");
-    } else {
-      res.status(200).send("Hello World!");
-    }
+    getIndexRoute(req, res, isFaulty);
   });
 
   // start the consensus once all nodes are ready
   app.post("/ready", (req: Request, res: Response) => {
-    // faulty nodes can still say they are ready
-    if (isReady(readyStates)) {
-      return;
-    }
-
-    if (
-      typeof req.body.nodeIndex !== "number" ||
-      req.body.nodeIndex < 0 ||
-      req.body.nodeIndex >= N
-    ) {
-      throw new Error(`Wrong req body - ${req.body.nodeIndex}`);
-    }
-
-    readyStates[req.body.nodeIndex] = true;
-    sendIsReadyToAllNodes(nodeIndex, N);
-
-    res.status(200).send();
+    postReady(req, res, readyStates, nodeIndex, N);
   });
 
   app.get("/ready", (req: Request, res: Response) => {
     res.send(`Status - ${isReady(readyStates) ? "ready" : "not ready"}`);
   });
 
+  app.get("/finished", (req: Request, res: Response) => {
+    return res
+      .status(200)
+      .json({ finished: nodeVar.decision !== undefined || isFaulty });
+  });
+
   // ROUTE WHERE MESSAGES ARE RECEIVED
 
-  // need to have a better data structure to take into consideration
-  // future rounds if certain nodes are faster
-  type ReceivedObjectType = {
-    R: Array<{ receivedCount: number; receivedValue: number }>;
-    P: Array<{
-      receivedCount: number;
-      receivedOnes: number;
-      receivedZeros: number;
-      receivedMinusOnes: number;
-    }>;
-  };
   const receivedObject: ReceivedObjectType = {
     P: [],
     R: [],
   };
 
   app.post("/", (req: Request, res: Response) => {
-    // req.body: {nodeIndex: number, round: number, tag: TagType, value: ValueType}
-
-    if (isFaulty) {
-      res.status(500).send("Node is faulty");
-      return;
-    }
-
-    if (decision !== undefined) {
-      return;
-    }
-
-    if (req.body.tag === "R") {
-      // if receivedObject.R is too small (round object doesn't exist), create it
-      const lengthDiff = req.body.round - receivedObject.R.length;
-      for (let index = 0; index < lengthDiff; index++) {
-        receivedObject.R.push({
-          receivedCount: 0,
-          receivedValue: 0,
-        });
-      }
-
-      receivedObject.R[req.body.round - 1].receivedCount += 1;
-      if (req.body.state === 1) {
-        receivedObject.R[req.body.round - 1].receivedValue += 1;
-      } else {
-        receivedObject.R[req.body.round - 1].receivedValue -= 1;
-      }
-
-      // console.log(
-      //   `<-- Received tag=R from Node #${
-      //     req.body.nodeIndex
-      //   } to Node #${nodeIndex} in round=${req.body.round} with value=${
-      //     req.body.state
-      //   }, count is ${receivedObject.R[req.body.round - 1].receivedCount}`
-      // );
-
-      // take decision if count is greater than N - F
-      if (receivedObject.R[req.body.round - 1].receivedCount >= N - F) {
-        if (receivedObject.R[req.body.round - 1].receivedValue !== 0) {
-          const v =
-            receivedObject.R[req.body.round - 1].receivedValue < 0 ? 0 : 1;
-          broadcastStateToAllNodes(v, nodeIndex, "P", round, N, F);
-        } else {
-          broadcastStateToAllNodes(-1, nodeIndex, "P", round, N, F);
-        }
-      }
-    } else if (req.body.tag === "P") {
-      // console.log("P", receivedObject.P, req.body.round);
-
-      // if receivedObject.P is too small (round object doesn't exist), create it
-      const lengthDiff = req.body.round - receivedObject.P.length;
-      for (let index = 0; index < lengthDiff; index++) {
-        receivedObject.P.push({
-          receivedCount: 0,
-          receivedOnes: 0,
-          receivedZeros: 0,
-          receivedMinusOnes: 0,
-        });
-      }
-
-      receivedObject.P[req.body.round - 1].receivedCount += 1;
-      if (req.body.state === 1) {
-        receivedObject.P[req.body.round - 1].receivedOnes += 1;
-      } else if (req.body.state === 0) {
-        receivedObject.P[req.body.round - 1].receivedZeros += 1;
-      } else if (req.body.state === -1) {
-        receivedObject.P[req.body.round - 1].receivedMinusOnes += 1;
-      } else {
-        throw new Error(`value error - ${req.body.state}`);
-      }
-
-      // take decision if condition is met
-      if (receivedObject.P[req.body.round - 1].receivedCount >= N - F) {
-        logs.push(
-          `RECEIVED_ENOUGH_P_MESSAGES-r${round}-s${step}-#${nodeIndex}`
-        );
-        step++;
-        if (receivedObject.P[req.body.round - 1].receivedOnes > F + 1) {
-          // decide 1
-          console.log(`DECISION - ${nodeIndex} - 1`);
-          decision = 1;
-          logs.push(`DECISION_r${round}_s${step + 1}-#${nodeIndex}-1`);
-          step++;
-        } else if (receivedObject.P[req.body.round - 1].receivedZeros > F + 1) {
-          // decide 0
-          console.log(`DECISION - ${nodeIndex} - 0`);
-          decision = 0;
-          logs.push(`DECISION_r${round}_s${step + 1}-#${nodeIndex}-0`);
-          step++;
-        } else if (receivedObject.P[req.body.round - 1].receivedOnes > 0) {
-          state = 1;
-          goToNextRound();
-          logs.push(`CHANGE_STATE_r${round}_s${step + 1}-#${nodeIndex}-1`);
-          step++;
-        } else if (receivedObject.P[req.body.round - 1].receivedZeros > 0) {
-          state = 0;
-          goToNextRound();
-          logs.push(`CHANGE_STATE_r${round}_s${step + 1}-#${nodeIndex}-0`);
-          step++;
-        } else {
-          state = Math.floor((Math.random() * 100) % 2) === 0 ? 0 : 1;
-          goToNextRound();
-          logs.push(
-            `CHANGE_RND_STATE_r${round}_s${step + 1}-#${nodeIndex}-${state}`
-          );
-          step++;
-        }
-      }
-    } else {
-      throw new Error(`tag error ${req.body.tag}`);
-    }
+    postIndexRoute(
+      req,
+      res,
+      nodeVar,
+      isFaulty,
+      receivedObject,
+      N,
+      F,
+      globalVar,
+      logs,
+      goToNextRound
+    );
   });
 
   app.listen(port, () => {
     console.log(`Example app listening on port ${port}`);
-    sendIsReadyToAllNodes(nodeIndex, N);
+    sendIsReadyToAllNodes(nodeVar.index, N);
 
     if (!isFaulty) {
-      logs.push(`INITSTATE_r${round}_s${step + 1}-#${nodeIndex}-${state}`);
-      step++;
+      logs.push(
+        `INITSTATE_r${nodeVar.round}_s${globalVar.step + 1}-#${
+          nodeVar.index
+        }-s${nodeVar.state}`
+      );
+      globalVar.step += 1;
       setInterval(() => {
         iterateBenOr();
       }, 100);
     } else {
-      logs.push(`FAULTY_r${round}_s${step + 1}-#${nodeIndex}`);
-      step++;
+      logs.push(
+        `FAULTY_r${nodeVar.round}_s${globalVar.step + 1}-#${nodeVar.index}`
+      );
+      globalVar.step += 1;
     }
   });
 
@@ -285,7 +121,16 @@ const launchNode = async (
     // 2nd step - broadcast to all nodes
     if (!broadcastedInitialMessages) {
       broadcastedInitialMessages = true;
-      broadcastStateToAllNodes(state, nodeIndex, "R", round, N, F);
+      broadcastStateToAllNodes(
+        nodeVar.state,
+        nodeVar.index,
+        "R",
+        nodeVar.round,
+        N,
+        F,
+        globalVar,
+        logs
+      );
       return;
     }
 
@@ -331,23 +176,38 @@ const launchMultipleNodes = async (
     );
   }
 
-  // save logs
-  setTimeout(() => {
+  // save logs if nodes are done
+  let saved = false;
+  setInterval(async () => {
+    if (saved) return;
+
+    for (let index = 0; index < N; index++) {
+      const hasFinished = await fetch(
+        `http://localhost:${3000 + index}/finished`
+      )
+        .then((res) => res.json())
+        .then((json) => json.finished);
+
+      console.log("finished", hasFinished);
+
+      if (!hasFinished) return;
+    }
+    saved = true;
     fs.writeFile(
       `logs/${runIdentifier}_logs.logs`,
       logs.join("\n"),
       function (err) {
         if (err) return console.log(err);
-        console.log("logs saved in /logs");
+        console.log(
+          `FINISHED - logs saved in /logs/${runIdentifier}_logs.logs`
+        );
       }
     );
-  }, 2000);
-
-  // launch consensus watcher
+  }, 500);
 };
 
-const initialState: Array<StateType> = [1, 1, 1, 1, 1, 0, 0, 0, 0, 0];
+const initialState: Array<StateType> = [1, 1, 1, 0, 0];
 
 const runIdentifier = new Date().getTime().toString();
 
-launchMultipleNodes(initialState.length, 4, initialState, runIdentifier);
+launchMultipleNodes(initialState.length, 2, initialState, runIdentifier);
