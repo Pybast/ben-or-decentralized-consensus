@@ -29,8 +29,7 @@ const launchNode = async (
   isFaulty: boolean,
   port: number,
   N: number,
-  F: number,
-  runIdentifier: string
+  F: number
 ) => {
   const app = express();
   app.set("trust proxy", 1);
@@ -93,7 +92,7 @@ const launchNode = async (
   });
 
   app.listen(port, () => {
-    console.log(`Example app listening on port ${port}`);
+    console.log(`Node listening on port ${port}`);
     sendIsReadyToAllNodes(nodeVar.index, N);
 
     if (!isFaulty) {
@@ -141,9 +140,13 @@ const launchNode = async (
 const launchMultipleNodes = async (
   N: number,
   F: number,
+  actualNumberF: number,
   initialState: Array<StateType>,
   runIdentifier: string
 ) => {
+  if (actualNumberF > F) {
+    throw new Error("You can't have more actualNumberF than F");
+  }
   if (F >= N / 2) {
     throw new Error(
       `The Ben-or decentralized consensus algorithm needs to have at least half of his processes running - got ${Math.floor(
@@ -157,8 +160,7 @@ const launchMultipleNodes = async (
 
   // determines faulty indexes
   let nodeIsFaultyArray = Array(N).fill(false);
-  setFaultyNodes(nodeIsFaultyArray, F);
-  console.log(nodeIsFaultyArray);
+  setFaultyNodes(nodeIsFaultyArray, actualNumberF);
 
   for (let index = 0; index < N; index++) {
     // if faulty index => faulty
@@ -171,8 +173,7 @@ const launchMultipleNodes = async (
       nodeIsFaultyArray[index],
       3000 + index,
       N,
-      F,
-      runIdentifier
+      F
     );
   }
 
@@ -201,13 +202,23 @@ const launchMultipleNodes = async (
         console.log(
           `FINISHED - logs saved in /logs/${runIdentifier}_logs.logs`
         );
+        process.exit();
       }
     );
   }, 500);
 };
 
-const initialState: Array<StateType> = [1, 1, 1, 0, 0];
+const INITIAL_STATE: Array<StateType> = [1, 1, 1, 0, 0];
+const N = INITIAL_STATE.length;
+const MAX_NUMBER_FAULTY = 2; // F
+const NUMBER_FAULTY = 1;
 
 const runIdentifier = new Date().getTime().toString();
 
-launchMultipleNodes(initialState.length, 2, initialState, runIdentifier);
+launchMultipleNodes(
+  N,
+  MAX_NUMBER_FAULTY,
+  NUMBER_FAULTY,
+  INITIAL_STATE,
+  runIdentifier
+);
